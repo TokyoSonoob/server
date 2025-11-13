@@ -1,187 +1,145 @@
 // server.js
-// เซิร์ฟเวอร์รับโค้ดจาก client แล้วรันเป็น Discord bot ด้วย process แยก
+// ตัวเล็กๆไว้รันโค้ด Discord bot จาก client
 
-const express = require('express');
-const cors = require('cors');
-const bodyParser = require('body-parser');
-const fs = require('fs');
-const path = require('path');
-const { spawn } = require('child_process');
+const express = require("express");
+const cors = require("cors");
+const bodyParser = require("body-parser");
+const vm = require("vm");
+const Discord = require("discord.js");
 
 const app = express();
-const PORT = process.env.PORT || 3000; // Render จะเซ็ต PORT ให้เอง
-
 app.use(cors());
-app.use(bodyParser.json({ limit: '1mb' }));
+app.use(bodyParser.json({ limit: "1mb" }));
 
-// โฟลเดอร์เก็บไฟล์โค้ดชั่วคราว
-const SESSIONS_DIR = path.join(__dirname, 'sessions');
-if (!fs.existsSync(SESSIONS_DIR)) {
-  fs.mkdirSync(SESSIONS_DIR);
-}
+let currentStop = null; // ฟังก์ชันหยุดบอทตัวล่าสุด
 
-// เก็บ process และไฟล์ของ bot ที่กำลังรันอยู่
-let currentBot = null;
-let currentBotFile = null;
-
-/**
- * สร้างไฟล์ JS ที่ wrap โค้ดของ user
- * @param {string} userCode - โค้ดที่ส่งมาจาก client (ส่วน client.on(...) ต่าง ๆ)
- * @returns {string} path ของไฟล์ bot ที่สร้าง
- */
-function createBotFile(userCode) {
-  const filename = `session-bot-${Date.now()}.js`;
-  const filePath = path.join(SESSIONS_DIR, filename);
-
-  const content = `
-// ==== Auto-generated bot wrapper ====
-
-const { Client, GatewayIntentBits, Partials } = require('discord.js');
-
-const TOKEN = process.env.DISCORD_TOKEN;
-if (!TOKEN) {
-  console.error('[FATAL] DISCORD_TOKEN is missing in env');
-  process.exit(1);
-}
-
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ],
-  partials: [Partials.Channel, Partials.Message]
-});
-
-client.once('ready', () => {
-  console.log('[BOT] Logged in as ' + client.user.tag);
-});
-
-// ===== User code starts here =====
-try {
-${userCode}
-} catch (err) {
-  console.error('[USER_CODE_ERROR]', err);
-}
-// ===== User code ends here =====
-
-client.on('error', (err) => {
-  console.error('[CLIENT_ERROR]', err);
-});
-
-client.login(TOKEN).catch(err => {
-  console.error('[LOGIN_ERROR]', err);
-  process.exit(1);
-});
-
-process.on('unhandledRejection', (reason) => {
-  console.error('[UNHANDLED_REJECTION]', reason);
-});
-`;
-
-  fs.writeFileSync(filePath, content, 'utf8');
-  return filePath;
-}
-
-/**
- * หยุด bot ตัวเก่าถ้ามี
- */
-function stopCurrentBot() {
-  if (currentBot) {
-    console.log('[SERVER] Killing previous bot process...');
-    currentBot.kill('SIGTERM');
-    currentBot = null;
+// POST /run  <-- ตรงกับที่แอปส่งมาแล้ว
+app.post("/run", async (req, res) => {
+  const { code, env } = req.body || {};
+  if (!code || typeof code !== "string") {
+    return res.status(400).send("field `code` (string) is required");
   }
 
-  if (currentBotFile && fs.existsSync(currentBotFile)) {
+  // ผสม ENV ที่ส่งมาจากแอปเข้าไปใน process.env
+  if (env && typeof env === "object") {
+    Object.assign(process.env, env);
+  }
+
+  // ถ้ามีบอทเก่ารันอยู่ให้หยุดก่อน
+  if (currentStop) {
     try {
-      fs.unlinkSync(currentBotFile);
+      await currentStop();
     } catch (e) {
-      console.warn('[SERVER] Failed to delete temp bot file:', e.message);
+      console.error("[stop old bot error]", e);
     }
-    currentBotFile = null;
-  }
-}
-
-/**
- * รัน bot ใหม่จากโค้ดที่ส่งมา
- * @param {string} code - user code
- * @param {object} env - ข้อมูล env เช่น DISCORD_TOKEN
- */
-function startBot(code, env) {
-  stopCurrentBot();
-
-  const botFilePath = createBotFile(code);
-  currentBotFile = botFilePath;
-
-  console.log('[SERVER] Spawning new bot process:', botFilePath);
-
-  const child = spawn('node', [botFilePath], {
-    env: {
-      ...process.env,
-      DISCORD_TOKEN: env.DISCORD_TOKEN || '',
-      GUILD_ID: env.GUILD_ID || ''
-    },
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
-
-  child.stdout.on('data', (data) => {
-    process.stdout.write('[BOT_LOG] ' + data.toString());
-  });
-
-  child.stderr.on('data', (data) => {
-    process.stderr.write('[BOT_ERR] ' + data.toString());
-  });
-
-  child.on('exit', (code, signal) => {
-    console.log(`[SERVER] Bot process exited (code=${code}, signal=${signal})`);
-  });
-
-  currentBot = child;
-}
-
-/**
- * POST /run-bot
- * body: {
- *   code: string,
- *   env?: {
- *     DISCORD_TOKEN?: string,
- *     GUILD_ID?: string
- *   }
- * }
- */
-app.post('/run-bot', (req, res) => {
-  const { code, env = {} } = req.body || {};
-
-  if (!code || typeof code !== 'string') {
-    return res.status(400).json({ ok: false, error: 'code is required (string)' });
+    currentStop = null;
   }
 
-  if (!env.DISCORD_TOKEN) {
-    return res.status(400).json({ ok: false, error: 'env.DISCORD_TOKEN is required' });
-  }
+  const logLines = [];
+  const log = (...args) => {
+    const line = args
+      .map((x) =>
+        typeof x === "string" ? x : (() => {
+          try {
+            return JSON.stringify(x);
+          } catch {
+            return String(x);
+          }
+        })()
+      )
+      .join(" ");
+    logLines.push(line);
+    console.log("[bot]", line);
+  };
+
+  // helper สร้าง client พร้อม intents พื้นฐาน
+  const makeClient = () => {
+    const client = new Discord.Client({
+      intents: [
+        Discord.GatewayIntentBits.Guilds,
+        Discord.GatewayIntentBits.GuildMessages,
+        Discord.GatewayIntentBits.MessageContent,
+      ],
+    });
+
+    // เวลาบอกให้ stop จะ destroy client นี้
+    currentStop = async () => {
+      try {
+        await client.destroy();
+      } catch (e) {
+        console.error("[destroy error]", e);
+      }
+      currentStop = null;
+    };
+
+    return client;
+  };
+
+  // แปลง `export default ...` ให้กลายเป็น CommonJS แทน
+  const normalized = String(code).replace(
+    /export\s+default\s+/,
+    "module.exports.default = "
+  );
+
+  const sandbox = {
+    module: { exports: {} },
+    exports: {},
+    require,      // ให้ใช้ require ปกติได้ (discord.js ฯลฯ)
+    console,
+    process,
+    setTimeout,
+    setInterval,
+    clearTimeout,
+    clearInterval,
+  };
 
   try {
-    startBot(code, env);
-    return res.json({ ok: true, message: 'Bot started with new code' });
+    vm.createContext(sandbox);
+    vm.runInContext(normalized, sandbox, { timeout: 10000 });
+
+    const fn =
+      sandbox.module.exports.default || sandbox.exports.default;
+
+    if (typeof fn !== "function") {
+      return res
+        .status(400)
+        .send("export default function not found in user code");
+    }
+
+    // รันฟังก์ชันของผู้ใช้
+    await fn({ Discord, makeClient, log });
+
+    log("User code executed without immediate error.");
+    return res.status(200).send(logLines.join("\n") + "\n");
   } catch (err) {
-    console.error('[SERVER_ERROR]', err);
-    return res.status(500).json({ ok: false, error: err.message });
+    console.error("[run error]", err);
+    currentStop = null;
+    return res
+      .status(500)
+      .send(String(err && err.stack ? err.stack : err));
   }
 });
 
-// แถม endpoint เช็คสถานะ
-app.get('/health', (req, res) => {
-  res.json({ ok: true, status: 'running' });
+// POST /stop  ใช้กับปุ่ม STOP ในแอป
+app.post("/stop", async (req, res) => {
+  if (!currentStop) {
+    return res.status(200).send("no bot is running");
+  }
+  try {
+    await currentStop();
+  } catch (e) {
+    console.error("[stop error]", e);
+  }
+  currentStop = null;
+  return res.status(200).send("stopped");
 });
 
-// ปิด server แล้วปิด bot ด้วย
-process.on('SIGINT', () => {
-  console.log('\n[SERVER] Shutting down...');
-  stopCurrentBot();
-  process.exit(0);
+// GET /  สำหรับเช็คว่า server ยังอยู่
+app.get("/", (req, res) => {
+  res.send("Bot runner server is up.");
 });
 
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`[SERVER] Bot runner listening on port ${PORT}`);
+  console.log("Server listening on port", PORT);
 });
