@@ -1,36 +1,36 @@
 // server.js
-// ตัวเล็กๆไว้รันโค้ด Discord bot จาก client
+// Generic bot runner – ไม่ผูกกับ discord.js อีกต่อไป
+// โค้ดที่ผู้ใช้ส่งเข้ามาจะมี require ของตัวเอง เช่น require("discord.js")
 
 const express = require("express");
 const cors = require("cors");
 const bodyParser = require("body-parser");
 const vm = require("vm");
-const Discord = require("discord.js");
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json({ limit: "1mb" }));
 
-let currentStop = null; // ฟังก์ชันหยุดบอทตัวล่าสุด
+let currentStop = null; // ฟังก์ชันหยุดงานล่าสุด (workers, intervals, bots ทุกชนิด)
 
-// POST /run  <-- ตรงกับที่แอปส่งมาแล้ว
+// POST /run
 app.post("/run", async (req, res) => {
   const { code, env } = req.body || {};
   if (!code || typeof code !== "string") {
     return res.status(400).send("field `code` (string) is required");
   }
 
-  // ผสม ENV ที่ส่งมาจากแอปเข้าไปใน process.env
+  // รวม ENV จากแอป
   if (env && typeof env === "object") {
     Object.assign(process.env, env);
   }
 
-  // ถ้ามีบอทเก่ารันอยู่ให้หยุดก่อน
+  // หยุดงานเก่าถ้ามี
   if (currentStop) {
     try {
       await currentStop();
-    } catch (e) {
-      console.error("[stop old bot error]", e);
+    } catch (err) {
+      console.error("[stop old error]", err);
     }
     currentStop = null;
   }
@@ -38,53 +38,30 @@ app.post("/run", async (req, res) => {
   const logLines = [];
   const log = (...args) => {
     const line = args
-      .map((x) =>
-        typeof x === "string" ? x : (() => {
-          try {
-            return JSON.stringify(x);
-          } catch {
-            return String(x);
-          }
-        })()
-      )
+      .map((x) => {
+        if (typeof x === "string") return x;
+        try {
+          return JSON.stringify(x);
+        } catch {
+          return String(x);
+        }
+      })
       .join(" ");
     logLines.push(line);
     console.log("[bot]", line);
   };
 
-  // helper สร้าง client พร้อม intents พื้นฐาน
-  const makeClient = () => {
-    const client = new Discord.Client({
-      intents: [
-        Discord.GatewayIntentBits.Guilds,
-        Discord.GatewayIntentBits.GuildMessages,
-        Discord.GatewayIntentBits.MessageContent,
-      ],
-    });
-
-    // เวลาบอกให้ stop จะ destroy client นี้
-    currentStop = async () => {
-      try {
-        await client.destroy();
-      } catch (e) {
-        console.error("[destroy error]", e);
-      }
-      currentStop = null;
-    };
-
-    return client;
-  };
-
-  // แปลง `export default ...` ให้กลายเป็น CommonJS แทน
+  // แปลง export default → CommonJS
   const normalized = String(code).replace(
     /export\s+default\s+/,
     "module.exports.default = "
   );
 
+  // sandbox สำหรับ user code
   const sandbox = {
     module: { exports: {} },
     exports: {},
-    require,      // ให้ใช้ require ปกติได้ (discord.js ฯลฯ)
+    require, // ให้ user code require อะไรก็ได้ (รวมถึง discord.js)
     console,
     process,
     setTimeout,
@@ -106,8 +83,17 @@ app.post("/run", async (req, res) => {
         .send("export default function not found in user code");
     }
 
-    // รันฟังก์ชันของผู้ใช้
-    await fn({ Discord, makeClient, log });
+    // ให้สิทธิ user ตั้ง stop function เอง
+    const setStop = (stopFn) => {
+      currentStop = stopFn;
+    };
+
+    // รันโค้ดผู้ใช้
+    await fn({
+      log,
+      env: process.env,
+      setStop,
+    });
 
     log("User code executed without immediate error.");
     return res.status(200).send(logLines.join("\n") + "\n");
@@ -120,23 +106,25 @@ app.post("/run", async (req, res) => {
   }
 });
 
-// POST /stop  ใช้กับปุ่ม STOP ในแอป
+// STOP
 app.post("/stop", async (req, res) => {
   if (!currentStop) {
     return res.status(200).send("no bot is running");
   }
+
   try {
     await currentStop();
   } catch (e) {
     console.error("[stop error]", e);
   }
+
   currentStop = null;
   return res.status(200).send("stopped");
 });
 
-// GET /  สำหรับเช็คว่า server ยังอยู่
+// CHECK server
 app.get("/", (req, res) => {
-  res.send("Bot runner server is up.");
+  res.send("Generic Bot Runner is up.");
 });
 
 const PORT = process.env.PORT || 3000;
